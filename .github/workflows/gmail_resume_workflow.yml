@@ -33,10 +33,10 @@ jobs:
           PYTHONUTF8: "1"
         run: python main.py
 
-      - name: Persist processed IDs back to repo
+      - name: Persist state back to repo
         run: |
           git config user.email "github-actions@github.com"
           git config user.name  "GitHub Actions"
-          git add processed_ids.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "chore: update processed_ids [skip ci]"
+          git add processed_ids.json replied_senders.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "chore: update processed_ids and replied_senders [skip ci]"
           git push || true

@@ -42,7 +42,8 @@ TOKEN_FILE       = BASE_DIR / "token.pickle"
 # Place your resume in the same folder as this script; change the name here if needed.
 RESUME_FILE         = BASE_DIR / "Revathi Battina- Resume.docx"
 UPDATED_RESUME_FILE = BASE_DIR / "resume_updated.docx"
-PROCESSED_IDS_FILE  = BASE_DIR / "processed_ids.json"
+PROCESSED_IDS_FILE   = BASE_DIR / "processed_ids.json"
+REPLIED_SENDERS_FILE = BASE_DIR / "replied_senders.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -89,6 +90,21 @@ def save_processed_id(msg_id: str) -> None:
     ids = load_processed_ids()
     ids.add(msg_id)
     PROCESSED_IDS_FILE.write_text(json.dumps(list(ids)))
+
+def load_replied_senders() -> set:
+    if REPLIED_SENDERS_FILE.exists():
+        return set(json.loads(REPLIED_SENDERS_FILE.read_text()))
+    return set()
+
+def save_replied_sender(sender: str) -> None:
+    senders = load_replied_senders()
+    senders.add(_extract_email(sender))
+    REPLIED_SENDERS_FILE.write_text(json.dumps(list(senders)))
+
+def _extract_email(address: str) -> str:
+    """Pull bare email from 'Name <email@x.com>' or return as-is."""
+    match = re.search(r"<([^>]+)>", address)
+    return match.group(1).lower() if match else address.lower()
 
 # ─── Fetch Latest Emails ──────────────────────────────────────────────────────
 
@@ -176,6 +192,8 @@ def detect_resume_request(email: dict) -> dict:
         f"{email['body'][:3000]}"    # cap tokens
     )
 
+    already_replied = _extract_email(email["from"]) in load_replied_senders()
+
     prompt = f"""Analyze the email below and determine whether it is requesting a resume or CV that highlights specific technical skills.
 
 Email:
@@ -186,16 +204,18 @@ Email:
 Reply with ONLY a valid JSON object — no other text:
 {{
   "is_resume_request": true or false,
+  "is_update_request": true or false,
   "skills": ["Skill1", "Skill2"],
   "reason": "one-line explanation"
 }}
 
 Rules:
 - Set is_resume_request to true if the sender asks for a resume/CV (explicitly or implicitly, e.g. "please share your updated resume", "we need someone with X, please apply").
+- Set is_update_request to true ONLY if the sender is explicitly asking for a NEW or UPDATED resume with different/additional skills compared to what was sent before (e.g. "can you send an updated resume highlighting X", "we now need Y skills", "please resend with focus on Z").
 - List every concrete technical skill, language, framework, tool, or platform mentioned (e.g. "Python", "React", "AWS", "Docker").
 - Exclude soft skills ("communication", "leadership") and vague terms ("experience").
 - If no skills are mentioned, return an empty array.
-- Return false for is_resume_request if it is a newsletter, promotion, or unrelated message."""
+- Return false for is_resume_request if it is a newsletter, promotion, follow-up, thank-you, or unrelated message."""
 
     response = client.messages.create(
         model="claude-haiku-4-5",
@@ -207,12 +227,14 @@ Rules:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group())
+            result = json.loads(match.group())
+            result["_already_replied"] = already_replied
+            return result
         except json.JSONDecodeError:
             pass
 
     print(f"[Claude] Unexpected response: {raw[:200]}")
-    return {"is_resume_request": False, "skills": [], "reason": "parse error"}
+    return {"is_resume_request": False, "is_update_request": False, "skills": [], "reason": "parse error", "_already_replied": already_replied}
 
 # ─── Human-Written Text via Claude ───────────────────────────────────────────
 
@@ -478,8 +500,12 @@ def main():
         result = detect_resume_request(em)
 
         if result.get("is_resume_request") and result.get("skills"):
-            print(f"         → RESUME REQUEST  skills: {result['skills']}")
-            requests_found.append({"email": em, "skills": result["skills"]})
+            if result.get("_already_replied") and not result.get("is_update_request"):
+                print(f"         → skipped (already replied to this sender, no update requested)")
+            else:
+                tag = "UPDATE REQUEST" if result.get("is_update_request") else "RESUME REQUEST"
+                print(f"         → {tag}  skills: {result['skills']}")
+                requests_found.append({"email": em, "skills": result["skills"]})
         else:
             reason = result.get("reason", "—")
             print(f"         → not a request  ({reason})")
@@ -503,7 +529,8 @@ def main():
         print(f"  Skills: {skills}")
 
         if update_resume(skills):
-            send_reply(service, em, skills)
+            if send_reply(service, em, skills):
+                save_replied_sender(em["from"])
         else:
             print("  Skipping reply because resume could not be updated.")
         save_processed_id(em["id"])
