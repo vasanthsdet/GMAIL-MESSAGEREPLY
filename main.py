@@ -53,7 +53,7 @@ SCOPES = [
 # ─── Gmail OAuth2 ─────────────────────────────────────────────────────────────
 
 def get_gmail_service():
-    """Authenticate and return an authorised Gmail API service object."""
+    """Authenticate and return an authorised Gmail API service object and own email address."""
     creds = None
 
     if TOKEN_FILE.exists():
@@ -77,7 +77,9 @@ def get_gmail_service():
         with open(TOKEN_FILE, "wb") as fh:
             pickle.dump(creds, fh)
 
-    return build("gmail", "v1", credentials=creds)
+    service = build("gmail", "v1", credentials=creds)
+    own_email = service.users().getProfile(userId="me").execute()["emailAddress"].lower()
+    return service, own_email
 
 # ─── Processed IDs (deduplication) ───────────────────────────────────────────
 
@@ -108,7 +110,7 @@ def _extract_email(address: str) -> str:
 
 # ─── Fetch Latest Emails ──────────────────────────────────────────────────────
 
-def get_latest_emails(service, max_results: int = 30) -> list[dict]:
+def get_latest_emails(service, own_email: str, max_results: int = 30) -> list[dict]:
     """Return the latest inbox messages, skipping already-processed ones."""
     processed = load_processed_ids()
     try:
@@ -128,7 +130,11 @@ def get_latest_emails(service, max_results: int = 30) -> list[dict]:
             full = service.users().messages().get(
                 userId="me", id=msg["id"], format="full"
             ).execute()
-            emails.append(_parse_message(full))
+            parsed = _parse_message(full)
+            if _extract_email(parsed["from"]) == own_email:
+                save_processed_id(parsed["id"])  # mark so we never revisit
+                continue
+            emails.append(parsed)
         except HttpError as exc:
             print(f"[Gmail] Error fetching message {msg['id']}: {exc}")
 
@@ -472,12 +478,12 @@ def main():
 
     # Step 1 — Authenticate
     print("\n[1/4] Authenticating with Gmail …")
-    service = get_gmail_service()
-    print("      Done.")
+    service, own_email = get_gmail_service()
+    print(f"      Authenticated as {own_email}")
 
     # Step 2 — Fetch latest 30 unprocessed emails
     print("\n[2/4] Fetching latest 30 emails …")
-    emails = get_latest_emails(service, max_results=30)
+    emails = get_latest_emails(service, own_email, max_results=30)
     print(f"      Found {len(emails)} new email(s).")
 
     if not emails:
