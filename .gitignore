@@ -1,0 +1,8 @@
+credentials.json
+token.pickle
+processed_ids.json
+resume_updated.docx
+__pycache__/
+*.pyc
+*.pyo
+.env

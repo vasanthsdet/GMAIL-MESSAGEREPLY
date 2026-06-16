@@ -1,0 +1,41 @@
+name: Gmail Resume Workflow
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore Gmail credentials & token
+        run: |
+          echo "${{ secrets.GMAIL_CREDENTIALS }}" | base64 -d > credentials.json
+          echo "${{ secrets.GMAIL_TOKEN }}"        | base64 -d > token.pickle
+
+      - name: Run workflow
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONUTF8: "1"
+        run: python main.py
+
+      - name: Persist processed IDs back to repo
+        run: |
+          git config user.email "github-actions@github.com"
+          git config user.name  "GitHub Actions"
+          git add processed_ids.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "chore: update processed_ids [skip ci]"
+          git push || true
