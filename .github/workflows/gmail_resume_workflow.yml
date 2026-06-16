@@ -25,6 +25,7 @@ jobs:
         run: |
           echo "${{ secrets.GMAIL_CREDENTIALS }}" | base64 -d > credentials.json
           echo "${{ secrets.GMAIL_TOKEN }}"        | base64 -d > token.pickle
+          echo "${{ secrets.RESUME_DOCX }}"        | base64 -d > "Revathi Battina- Resume.docx"
 
       - name: Run workflow
         env:
