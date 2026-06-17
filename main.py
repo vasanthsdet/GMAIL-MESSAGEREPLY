@@ -108,6 +108,18 @@ def _extract_email(address: str) -> str:
     match = re.search(r"<([^>]+)>", address)
     return match.group(1).lower() if match else address.lower()
 
+def thread_has_our_reply(service, thread_id: str, own_email: str) -> bool:
+    """Return True if we (or user manually) already sent a message in this thread."""
+    try:
+        thread = service.users().threads().get(userId="me", id=thread_id).execute()
+        for msg in thread.get("messages", []):
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            if _extract_email(headers.get("From", "")) == own_email:
+                return True
+    except HttpError:
+        pass
+    return False
+
 # ─── Fetch Latest Emails ──────────────────────────────────────────────────────
 
 def get_latest_emails(service, own_email: str, max_results: int = 30) -> list[dict]:
@@ -144,14 +156,16 @@ def get_latest_emails(service, own_email: str, max_results: int = 30) -> list[di
 def _parse_message(message: dict) -> dict:
     headers = {h["name"]: h["value"] for h in message["payload"]["headers"]}
     return {
-        "id":        message["id"],
-        "thread_id": message["threadId"],
-        "from":      headers.get("From", ""),
-        "to":        headers.get("To", ""),
-        "subject":   headers.get("Subject", "(no subject)"),
-        "date":      headers.get("Date", ""),
-        "body":      _extract_text(message["payload"]),
-        "snippet":   message.get("snippet", ""),
+        "id":         message["id"],
+        "thread_id":  message["threadId"],
+        "message_id": headers.get("Message-ID", ""),
+        "from":       headers.get("From", ""),
+        "to":         headers.get("To", ""),
+        "cc":         headers.get("Cc", ""),
+        "subject":    headers.get("Subject", "(no subject)"),
+        "date":       headers.get("Date", ""),
+        "body":       _extract_text(message["payload"]),
+        "snippet":    message.get("snippet", ""),
     }
 
 
@@ -198,8 +212,6 @@ def detect_resume_request(email: dict) -> dict:
         f"{email['body'][:3000]}"    # cap tokens
     )
 
-    already_replied = _extract_email(email["from"]) in load_replied_senders()
-
     prompt = f"""Analyze the email below and determine whether it is requesting a resume or CV that highlights specific technical skills.
 
 Email:
@@ -210,14 +222,12 @@ Email:
 Reply with ONLY a valid JSON object — no other text:
 {{
   "is_resume_request": true or false,
-  "is_update_request": true or false,
   "skills": ["Skill1", "Skill2"],
   "reason": "one-line explanation"
 }}
 
 Rules:
 - Set is_resume_request to true if the sender asks for a resume/CV (explicitly or implicitly, e.g. "please share your updated resume", "we need someone with X, please apply").
-- Set is_update_request to true ONLY if the sender is explicitly asking for a NEW or UPDATED resume with different/additional skills compared to what was sent before (e.g. "can you send an updated resume highlighting X", "we now need Y skills", "please resend with focus on Z").
 - List every concrete technical skill, language, framework, tool, or platform mentioned (e.g. "Python", "React", "AWS", "Docker").
 - Exclude soft skills ("communication", "leadership") and vague terms ("experience").
 - If no skills are mentioned, return an empty array.
@@ -233,14 +243,12 @@ Rules:
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
-            result = json.loads(match.group())
-            result["_already_replied"] = already_replied
-            return result
+            return json.loads(match.group())
         except json.JSONDecodeError:
             pass
 
     print(f"[Claude] Unexpected response: {raw[:200]}")
-    return {"is_resume_request": False, "is_update_request": False, "skills": [], "reason": "parse error", "_already_replied": already_replied}
+    return {"is_resume_request": False, "skills": [], "reason": "parse error"}
 
 # ─── Human-Written Text via Claude ───────────────────────────────────────────
 
@@ -430,8 +438,8 @@ def update_resume(skills: list[str]) -> bool:
 
 # ─── Send Gmail Reply with Attachment ─────────────────────────────────────────
 
-def send_reply(service, original: dict, skills: list[str]) -> bool:
-    """Reply to `original` with the updated resume as an attachment."""
+def send_reply(service, original: dict, skills: list[str], own_email: str) -> bool:
+    """Reply-all to `original` with the updated resume as an attachment."""
     if not UPDATED_RESUME_FILE.exists():
         print("[Gmail] Updated resume not found — cannot send reply.")
         return False
@@ -439,11 +447,21 @@ def send_reply(service, original: dict, skills: list[str]) -> bool:
     print("[Claude] Writing reply …")
     body_text = _write_reply_text(original, skills)
 
+    # Build reply-all Cc: original To + original Cc, excluding ourselves
+    cc_parts = []
+    for field in (original.get("to", ""), original.get("cc", "")):
+        for addr in field.split(","):
+            addr = addr.strip()
+            if addr and _extract_email(addr) != own_email:
+                cc_parts.append(addr)
+
     msg = MIMEMultipart()
-    msg["To"]         = original["from"]
-    msg["Subject"]    = f"Re: {original['subject']}"
-    msg["In-Reply-To"] = original["id"]
-    msg["References"]  = original["id"]
+    msg["To"]          = original["from"]
+    msg["Subject"]     = f"Re: {original['subject']}"
+    msg["In-Reply-To"] = original["message_id"] or original["id"]
+    msg["References"]  = original["message_id"] or original["id"]
+    if cc_parts:
+        msg["Cc"] = ", ".join(cc_parts)
     msg.attach(MIMEText(body_text, "plain"))
 
     with open(UPDATED_RESUME_FILE, "rb") as fh:
@@ -457,13 +475,14 @@ def send_reply(service, original: dict, skills: list[str]) -> bool:
     part.add_header("Content-Disposition", 'attachment; filename="Resume.docx"')
     msg.attach(part)
 
+    recipients = [original["from"]] + cc_parts
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     try:
         service.users().messages().send(
             userId="me",
             body={"raw": raw, "threadId": original["thread_id"]},
         ).execute()
-        print(f"[Gmail] Reply sent to {original['from']}")
+        print(f"[Gmail] Reply-all sent to {original['from']}" + (f" + {len(cc_parts)} cc" if cc_parts else ""))
         return True
     except HttpError as exc:
         print(f"[Gmail] Failed to send reply: {exc}")
@@ -503,15 +522,16 @@ def main():
             print(f"         → skipped (noreply sender: {sender[:60]})")
             continue
 
+        if thread_has_our_reply(service, em["thread_id"], own_email):
+            print(f"         → skipped (already replied in this thread)")
+            save_processed_id(em["id"])
+            continue
+
         result = detect_resume_request(em)
 
         if result.get("is_resume_request") and result.get("skills"):
-            if result.get("_already_replied") and not result.get("is_update_request"):
-                print(f"         → skipped (already replied to this sender, no update requested)")
-            else:
-                tag = "UPDATE REQUEST" if result.get("is_update_request") else "RESUME REQUEST"
-                print(f"         → {tag}  skills: {result['skills']}")
-                requests_found.append({"email": em, "skills": result["skills"]})
+            print(f"         → RESUME REQUEST  skills: {result['skills']}")
+            requests_found.append({"email": em, "skills": result["skills"]})
         else:
             reason = result.get("reason", "—")
             print(f"         → not a request  ({reason})")
@@ -535,8 +555,7 @@ def main():
         print(f"  Skills: {skills}")
 
         if update_resume(skills):
-            if send_reply(service, em, skills):
-                save_replied_sender(em["from"])
+            send_reply(service, em, skills, own_email)
         else:
             print("  Skipping reply because resume could not be updated.")
         save_processed_id(em["id"])
