@@ -12,6 +12,7 @@ Gmail Resume Workflow
 import truststore; truststore.inject_into_ssl()
 
 import os
+import sys
 import base64
 import pickle
 import json
@@ -438,7 +439,7 @@ def update_resume(skills: list[str]) -> bool:
 
 # ─── Send Gmail Reply with Attachment ─────────────────────────────────────────
 
-def send_reply(service, original: dict, skills: list[str], own_email: str) -> bool:
+def send_reply(service, original: dict, skills: list[str], own_email: str, dry_run: bool = False) -> bool:
     """Reply-all to `original` with the updated resume as an attachment."""
     if not UPDATED_RESUME_FILE.exists():
         print("[Gmail] Updated resume not found — cannot send reply.")
@@ -454,6 +455,18 @@ def send_reply(service, original: dict, skills: list[str], own_email: str) -> bo
             addr = addr.strip()
             if addr and _extract_email(addr) != own_email:
                 cc_parts.append(addr)
+
+    if dry_run:
+        print("\n" + "─" * 50)
+        print("  [DRY RUN] Would send:")
+        print(f"  To      : {original['from']}")
+        if cc_parts:
+            print(f"  Cc      : {', '.join(cc_parts)}")
+        print(f"  Subject : Re: {original['subject']}")
+        print(f"  Attach  : Resume.docx")
+        print(f"  Body    :\n{body_text}")
+        print("─" * 50 + "\n")
+        return True
 
     msg = MIMEMultipart()
     msg["To"]          = original["from"]
@@ -475,7 +488,6 @@ def send_reply(service, original: dict, skills: list[str], own_email: str) -> bo
     part.add_header("Content-Disposition", 'attachment; filename="Resume.docx"')
     msg.attach(part)
 
-    recipients = [original["from"]] + cc_parts
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     try:
         service.users().messages().send(
@@ -491,8 +503,9 @@ def send_reply(service, original: dict, skills: list[str], own_email: str) -> bo
 # ─── Main Workflow ────────────────────────────────────────────────────────────
 
 def main():
+    dry_run = "--dry-run" in sys.argv
     print("=" * 60)
-    print("  Gmail Resume Workflow")
+    print("  Gmail Resume Workflow" + ("  [DRY RUN]" if dry_run else ""))
     print("=" * 60)
 
     # Step 1 — Authenticate
@@ -538,9 +551,9 @@ def main():
 
     if not requests_found:
         print("\nNo resume requests found. Exiting.")
-        # Mark all scanned emails as processed so we don't re-scan them
-        for em in emails:
-            save_processed_id(em["id"])
+        if not dry_run:
+            for em in emails:
+                save_processed_id(em["id"])
         return
 
     print(f"\n  {len(requests_found)} resume request(s) to process.")
@@ -555,16 +568,18 @@ def main():
         print(f"  Skills: {skills}")
 
         if update_resume(skills):
-            send_reply(service, em, skills, own_email)
+            send_reply(service, em, skills, own_email, dry_run=dry_run)
         else:
             print("  Skipping reply because resume could not be updated.")
-        save_processed_id(em["id"])
-
-    # Mark non-request emails as processed too
-    request_ids = {req["email"]["id"] for req in requests_found}
-    for em in emails:
-        if em["id"] not in request_ids:
+        if not dry_run:
             save_processed_id(em["id"])
+
+    if not dry_run:
+        # Mark non-request emails as processed too
+        request_ids = {req["email"]["id"] for req in requests_found}
+        for em in emails:
+            if em["id"] not in request_ids:
+                save_processed_id(em["id"])
 
     print("\n" + "=" * 60)
     print("  Workflow complete.")
